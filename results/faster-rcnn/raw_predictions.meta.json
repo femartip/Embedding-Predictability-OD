@@ -1,0 +1,5 @@
+{
+    "nms_iou": 0.5,
+    "num_classes": 11,
+    "model": "faster-rcnn"
+}

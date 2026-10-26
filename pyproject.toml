@@ -1,0 +1,79 @@
+[project]
+name = "predictability-ad"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Felix",email = "felix.marti99@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11, <3.13"
+dependencies = [
+    "zod[cli] @ git+https://github.com/zenseact/zod.git@01ecd32",
+    "matplotlib (>=3.10.3,<4.0.0)",
+    "opencv-python (>=4.11.0.86,<5.0.0.0)",
+    "plotly (>=6.1.2,<7.0.0)",
+    "numpy (==1.26.4)",
+    "pandas (>=2.2.3,<3.0.0)",
+    "scikit-learn (>=1.6.1,<2.0.0)",
+    "ultralytics (>=8.4.0,<9.0.0)",
+    "fiftyone (>=1.16.0,<1.17.0)",
+    "graphql-core (>=3.2.0,<3.3.0)",
+    "accelerate (>=1.0.0,<2.0.0)",
+    "openmeteo-requests (>=1.5.0,<2.0.0)",
+    "requests-cache (>=1.2.1,<2.0.0)",
+    "retry-requests (>=2.0.0,<3.0.0)",
+    "pytz (>=2025.2,<2026.0)",
+    "tenacity (>=9.1.2,<10.0.0)",
+    "tensorboard (>=2.19.0,<3.0.0)",
+    "openmim (>=0.3.9,<0.4.0)",
+    "seaborn (>=0.13.2,<0.14.0)",
+    "libsvm (>=3.23.0.4,<4.0.0.0)",
+    "scikit-image (>=0.25.2,<0.26.0)",
+    "torchmetrics[image,detection] (>=1.7.3,<2.0.0)",
+    "piq (>=0.8.0,<0.9.0)",
+    "transformers (>=4.53.0,<5.0.0)",
+    "pycocotools (>=2.0.10,<3.0.0)",
+    "dotenv (>=0.9.9,<0.10.0)",
+    "xgboost (==2.1.4)",
+    "hf-transfer (>=0.1.9,<0.2.0)",
+    "autogluon (>=1.4.0,<2.0.0)",
+    "openai (>=2.14.0,<3.0.0)",
+    "rfdetr @ git+https://github.com/femartip/rf-detr.git@977953a9059631a58c3c85a0ba4765da724d65a6",
+    "google-genai (>=1.57.0,<2.0.0)",
+    "pysqlite3 (>=0.6.0,<0.7.0)",
+    "autogluon-multimodal (>=1.5.0,<2.0.0)",
+    "stackview (>=0.19.1,<0.20.0)",
+    "trl (>=0.26.2,<0.27.0)",
+    "trackio (>=0.14.2,<0.15.0)",
+    "torchvision (==0.24.1+cu128)",
+    "torch (==2.9.1+cu128)",
+    "bz2file (>=0.98,<0.99)",
+    "wandb (>=0.25.0,<0.26.0)",
+    "faster-coco-eval (>=1.6,<2)",
+]
+
+[tool.poetry]
+package-mode = false
+
+[[tool.poetry.source]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+priority = "explicit"
+
+
+[tool.poetry.dependencies]
+torchvision = {source = "pytorch-cu128"}
+torch = {source = "pytorch-cu128"}
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^7.1.0"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+zod = { git = "https://github.com/zenseact/zod.git", rev = "01ecd32", extras = ["cli"] }
+
+[dependency-groups]
+dev = [
+    "ipykernel (>=7.1.0,<8.0.0)"
+]
