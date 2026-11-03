@@ -20,18 +20,32 @@ from .data import DEFAULT_DATA
 from .encoders import ENCODERS
 
 
-def risk_curve(rows, lower_better):
-    ordered = rows.sort_values('predicted', ascending=lower_better)
-    risk = ordered.actual if lower_better else 1-ordered.actual
+def risk_curve(rows):
+    ordered = rows.sort_values('predicted', ascending=False)
+    risk = 1-ordered.actual
     risk = risk.groupby(ordered.predicted).transform('mean').to_numpy()
     return np.cumsum(risk)/np.arange(1, len(rows)+1)
 
 
-def metrics(rows, lower_better=False):
+def calibration_bins(rows, bins=25):
+    assigned = np.minimum((rows.predicted.to_numpy()*bins).astype(int), bins-1)
+    table = rows.assign(bin=assigned).groupby('bin').agg(
+        images=('actual', 'size'), actual=('actual', 'mean'), predicted=('predicted', 'mean'))
+    table['weight'] = table.images / len(rows)
+    table['absolute_gap'] = abs(table.predicted-table.actual)
+    return table
+
+
+def metrics(rows):
     actual, predicted = rows.actual.to_numpy(), rows.predicted.to_numpy()
+    assert np.isfinite(actual).all() and np.isfinite(predicted).all()
+    assert ((actual >= 0) & (actual <= 1) & (predicted >= 0) & (predicted <= 1)).all()
+    bins = calibration_bins(rows)
+    mae = mean_absolute_error(actual, predicted)
     rho = spearmanr(actual, predicted).statistic if np.std(predicted) > 1e-8 and np.std(actual) > 1e-8 else np.nan
-    return {'mae': mean_absolute_error(actual, predicted), 'r2': r2_score(actual, predicted),
-            'spearman': rho, 'aurc': risk_curve(rows, lower_better).mean()}
+    return {'mae': mae, 'r2': r2_score(actual, predicted),
+            'ece': float((bins.weight*bins.absolute_gap).sum()), 'calibration_bins': 25,
+            'spearman': rho, 'aurc': risk_curve(rows).mean()}
 
 
 def interval(rows, repeats, seed):
@@ -51,10 +65,9 @@ def diagnostics(rows, config, output):
     axes[0, 0].set(xlabel='Measured score', ylabel='Predicted score', xlim=(0, 1), ylim=(0, 1))
     axes[0, 1].hist(rows.predicted-rows.actual, bins=30)
     axes[0, 1].set(xlabel='Prediction error', ylabel='Images')
-    lower = config['target'] not in ['iou', 'lrp']
-    risk = rows.actual.to_numpy() if lower else 1-rows.actual.to_numpy()
+    risk = 1-rows.actual.to_numpy()
     n = np.arange(1, len(rows)+1)
-    axes[1, 0].plot(n/len(rows), risk_curve(rows, lower), label='Assessor')
+    axes[1, 0].plot(n/len(rows), risk_curve(rows), label='Assessor')
     axes[1, 0].plot(n/len(rows), np.cumsum(np.sort(risk))/n, label='Oracle')
     axes[1, 0].axhline(risk.mean(), color='gray', linestyle='--', label='Random expectation')
     axes[1, 0].set(xlabel='Coverage (fraction accepted)', ylabel='Mean detection error')
@@ -78,6 +91,8 @@ def save_results(runs, data, output, bootstrap=200):
     summary = []
     for file in sorted(runs.glob('*/predictions.csv')):
         config = json.loads(file.with_name('config.json').read_text())
+        if config['target'] != 'lrp':
+            continue
         predictions = pd.read_csv(file)
         run = file.parent.name
         curves = file.with_name('history.csv')
@@ -92,7 +107,17 @@ def save_results(runs, data, output, bootstrap=200):
             fig.savefig(output / f'{run}-learning.png', dpi=130)
             plt.close(fig)
         for (split, detector), group in predictions.groupby(['split', 'detector']):
-            values = metrics(group, config['target'] not in ['iou', 'lrp'])
+            values = metrics(group)
+            bins = calibration_bins(group)
+            bins.to_csv(output / f'{run}-{detector}-{split}-calibration.csv')
+            fig, ax = plt.subplots(figsize=(4, 4))
+            ax.plot([0, 1], [0, 1], 'k--')
+            ax.plot(bins.predicted, bins.actual, 'o-')
+            ax.set(xlabel='Mean predicted validity', ylabel='Mean measured 1 - LRP',
+                   xlim=(0, 1), ylim=(0, 1), title=f'{detector}: {split}')
+            fig.tight_layout()
+            fig.savefig(output / f'{run}-{detector}-{split}-reliability.png', dpi=130)
+            plt.close(fig)
             lo, hi = interval(group, bootstrap, config['seed'])
             name = config['features'] or f'{config["encoder"]}-{config["pool"]}-{config["size"]}-grid{config["grid"]}'
             if config['regressor'] == 'constant':
@@ -123,8 +148,15 @@ def save_results(runs, data, output, bootstrap=200):
     table.to_csv(output / 'summary.csv', index=False)
     aggregate = table.groupby(['method', 'detector', 'target', 'split', 'fraction'], as_index=False).agg(
         mae_mean=('mae', 'mean'), mae_seed_std=('mae', 'std'), runs=('seed', 'size'),
+        r2_mean=('r2', 'mean'), ece_mean=('ece', 'mean'),
         spearman_mean=('spearman', 'mean'), aurc_mean=('aurc', 'mean'))
     aggregate.to_csv(output / 'aggregate.csv', index=False)
+    (output / 'metrics.json').write_text(json.dumps({
+        'target': '1 - LRP error at matching IoU 0.5',
+        'ece': '25 equal-width prediction bins; sum(weight * abs(mean prediction - mean target))',
+        'mae': 'Mean absolute prediction-target error',
+        'scope': 'ECE against continuous image validity scores, not binary correctness probabilities',
+        'aurc': 'Mean prefix LRP error after sorting by descending predicted validity; lower is better'}, indent=2))
     validation = table[table.split == 'val']
     for (target, detector), rows in validation.groupby(['target', 'detector']):
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -145,7 +177,8 @@ def main():
     p.add_argument('--features', type=Path, help='Directory produced by features.py')
     p.add_argument('--detectors', nargs='+')
     p.add_argument('--encoders', nargs='+', choices=ENCODERS, default=ENCODERS)
-    p.add_argument('--targets', nargs='+', default=['iou', 'lrp'])
+    p.add_argument('--targets', nargs='+', choices=['lrp'], default=['lrp'])
+    p.add_argument('--evaluate-test', action='store_true', help='Also evaluate test after fixing the experiment configuration')
     p.add_argument('--pools', nargs='+', default=['global', 'mean', 'spatial'])
     p.add_argument('--seeds', nargs='+', default=['43'])
     p.add_argument('--fractions', nargs='+', default=['1'])
@@ -156,6 +189,10 @@ def main():
     p.add_argument('--results', type=Path, default=ROOT / 'results/assessors')
     p.add_argument('--bootstrap', type=int, default=200)
     p.add_argument('--report-only', action='store_true', help='Analyze saved runs without training')
+    p.add_argument('--prepare-targets', action='store_true')
+    p.add_argument('--extract-features', action='store_true')
+    p.add_argument('--selection', type=Path, default=ROOT / 'results/detector_accuracy/full_validation/selection.csv')
+    p.add_argument('--groups', type=Path, default=ROOT.parent / 'Validators-OD/data/metafeatures.csv')
     args = p.parse_args()
     if args.report_only:
         save_results(args.output, args.data, args.results, args.bootstrap)
@@ -164,18 +201,36 @@ def main():
         p.error('--features and --detectors are required unless --report-only is used')
     def execute(module, *flags):
         subprocess.run([sys.executable, '-m', 'src.assessors.'+module, *map(str, flags)], check=True, cwd=ROOT)
+    def status(phase, **details):
+        args.results.mkdir(parents=True, exist_ok=True)
+        (args.results / 'status.json').write_text(json.dumps({'phase': phase,
+            'detectors': args.detectors, 'encoders': args.encoders,
+            'evaluate_test': args.evaluate_test, **details}, indent=2))
+    if args.prepare_targets:
+        status('targets')
+        execute('prepare', '--groups', args.groups, '--selection', args.selection,
+                '--detectors', *args.detectors, '--output', args.data)
+    if args.extract_features:
+        status('features')
+        execute('features', '--data', args.data, '--encoders', *args.encoders, '--device', args.device)
     for target in args.targets:
         common = ['--data', args.data, '--detectors', *args.detectors, '--target', target,
                   '--seeds', *args.seeds, '--fractions', *args.fractions,
                   '--epochs', args.epochs, '--device', args.device, '--output', args.output]
         if args.shared:
             common += ['--shared']
+        if args.evaluate_test:
+            common += ['--evaluate-test']
+        status('assessors', regressor='constant')
         execute('train', *common, '--regressor', 'constant')
         paths = [args.features / 'quality.npz'] + [args.features / f'{e}-{pool}.npz' for e in args.encoders for pool in args.pools]
         for path in paths:
             for regressor in ['ridge', 'mlp']:
+                status('assessors', features=str(path), regressor=regressor)
                 execute('train', *common, '--features', path, '--regressor', regressor)
+    status('report')
     save_results(args.output, args.data, args.results, args.bootstrap)
+    status('complete')
 
 
 if __name__ == '__main__':

@@ -9,7 +9,7 @@ if __package__ in (None, ''):
 
 from src.models.catalog import MODELS, resolve_model
 from src.data.dataset import DEFAULT_COCO, ROOT, load_coco, as_fiftyone
-from src.models.adapters import load_pretrained, load_finetuned
+from src.models.adapters import load_pretrained, load_finetuned, set_resolution
 
 # Explicit coarse mapping for optional COCO baselines, never a substitute for fine-tuning.
 COCO_TO_ZOD = {'car': 'Vehicle', 'bus': 'Vehicle', 'truck': 'Vehicle', 'motorcycle': 'VulnerableVehicle',
@@ -50,7 +50,7 @@ def score_payload(prediction, target):
         return {'boxes': torch.tensor(payload['boxes'], dtype=torch.float32).reshape(-1, 4),
                 'scores': torch.tensor(payload['scores'], dtype=torch.float32),
                 'labels': torch.tensor(payload['labels'], dtype=torch.int64)}
-    scores = get_metrics([tensors(prediction)], [tensors(target)], metrics=['iou', 'lrp'])
+    scores = get_metrics([tensors(prediction)], [tensors(target)], metrics=['lrp'])
     return {**scores, 'confidence': prediction['scores']}
 
 
@@ -73,7 +73,7 @@ def run_split(args, family, model, split, manifest):
             scores = score_payload(prediction, target)
             predictions[image_id], detections[image_id] = prediction, scores
             if args.discretize_threshold is not None:
-                discretized[image_id] = {k: (float(v > args.discretize_threshold) if k in ('iou', 'lrp') and v is not None else v)
+                discretized[image_id] = {k: (float(v > args.discretize_threshold) if k == 'lrp' and v is not None else v)
                                         for k, v in scores.items()}
         base = args.output_dir or ROOT / 'results'
         # Preserve results/<family>/detections.json for the existing feature merger.
@@ -90,6 +90,7 @@ def run_split(args, family, model, split, manifest):
             'classes': data['classes'], 'label_ids': 'zero-based contiguous class indices',
             'box_format': 'xyxy', 'coordinate_size': [1344, 768],
             'confidence_threshold': args.confidence_threshold, 'sample_count': len(predictions),
+            'resolution_override': args.resolution,
             'partial': args.max_samples is not None, 'coco_dir': str(args.coco_dir.resolve()),
             'coarse_coco_mapping': COCO_TO_ZOD if args.pretrained else None})
         print(f'{family} / {split}: {len(predictions)} images saved to {output}')
@@ -116,6 +117,7 @@ def parse_args(argv=None):
     p.add_argument('--confidence-threshold', type=float, default=0.5)
     p.add_argument('--discretize-threshold', type=float)
     p.add_argument('--batch-size', type=int, default=4)
+    p.add_argument('--resolution', type=int, help='Override inference size; leave unset to use saved/default preprocessing')
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--max-samples', type=int)
     args = p.parse_args(argv)
@@ -151,6 +153,8 @@ def main(argv=None):
             model, manifest = load_finetuned(artifact, args.device)
             if manifest['family'] != family:
                 raise ValueError(f'{artifact} is for {manifest["family"]}, not {family}')
+        if args.resolution:
+            set_resolution(model, family, args.resolution)
         for split in splits:
             run_split(args, family, model, split, manifest)
         del model

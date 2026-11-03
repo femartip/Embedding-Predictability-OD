@@ -26,6 +26,10 @@ def parse_args(argv=None):
     p.add_argument('--resume', type=Path, help='Backend checkpoint (optimizer state required for full resumption)')
     p.add_argument('--epochs', type=int)
     p.add_argument('--batch-size', type=int)
+    p.add_argument('--resolution', type=int, help='Input size; defaults to the existing backend recipe')
+    p.add_argument('--multi-scale', type=float, default=.25, help='YOLO training scale variation; 0 disables it')
+    p.add_argument('--augment', action=argparse.BooleanOptionalAction, default=False,
+                   help='Light flips and color jitter for HF training')
     p.add_argument('--grad-accum-steps', type=int, help='Accumulate microbatches before each optimizer step')
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--max-steps', type=int, help='Override iteration budget; useful for a smoke run')
@@ -38,7 +42,7 @@ def parse_args(argv=None):
     p.add_argument('--eval-every', type=int, default=5000)
     p.add_argument('--warmup-ratio', type=float, default=.05)
     p.add_argument('--optimizer', default='auto')
-    p.add_argument('--init-checkpoint', type=Path, help='Weights only; starts a new optimization schedule')
+    p.add_argument('--init-checkpoint', type=Path, help='Weights only; HF uses its saved model directory')
     p.add_argument('--deterministic', action=argparse.BooleanOptionalAction, default=False)
     p.add_argument('--rf-groups', type=int, default=13)
     p.add_argument('--channels-last', action=argparse.BooleanOptionalAction, default=False)
@@ -86,6 +90,7 @@ def main(argv=None):
     categories = json.loads(next(args.coco_dir.glob('*_train.json')).read_text())['categories']
     classes = [c['name'] for c in sorted(categories, key=lambda c: c['id'])]
     settings = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    settings['evaluation_precision'] = 'backend_default' if spec.backend == 'ultralytics' else 'fp32'
     if spec.backend in ('ultralytics', 'rfdetr'):
         native_data = prepare_native_data(args.coco_dir, args.image_root, output / 'dataset', spec.backend)
         wrapper = load_pretrained(family, args.device)
@@ -102,25 +107,36 @@ def main(argv=None):
                     batch['img'] = batch['img'].contiguous(memory_format=torch.channels_last)
                     return batch
             recipe = dict(data=str(native_data / 'dataset.yaml'), project=str(output), name='train',
-                workers=args.workers, amp=args.amp, save=True, save_period=10, imgsz=512, rect=True,
+                workers=args.workers, amp=args.amp, save=True, save_period=10, imgsz=args.resolution or 512, rect=True,
                 pretrained=True, seed=args.seed, device=args.device, patience=args.patience,
                 epochs=args.epochs or 50, batch=args.batch_size or 32, plots=True,
                 exist_ok=True, lr0=args.lr or .001, optimizer=args.optimizer, deterministic=args.deterministic,
                 warmup_epochs=args.warmup_ratio*(args.epochs or 50),
-                multi_scale=0.25, resume=bool(args.resume))
+                multi_scale=args.multi_scale, resume=bool(args.resume))
             model.train(trainer=FastDetectionTrainer if args.channels_last else None, **recipe)
             checkpoint = output / 'train/weights/best.pt'
         else:
             from functools import partial
             import rfdetr.main as rf_main
             import rfdetr.engine as rf_engine
+            from copy import copy
             rf_engine.CocoEvaluator = RFCocoEvaluator
+            evaluate_native = rf_engine.evaluate
+            def evaluate_fp32(model, criterion, postprocess, data_loader, base_ds, device, args):
+                evaluation_args = copy(args)
+                evaluation_args.amp = False
+                evaluation_args.fp16_eval = False
+                return evaluate_native(model, criterion, postprocess, data_loader, base_ds, device, evaluation_args)
+            rf_main.evaluate = evaluate_fp32
             rf_main.DataLoader = partial(rf_main.DataLoader, pin_memory=True, persistent_workers=args.workers > 0)
-            if args.rf_groups != 13:
+            if args.rf_groups != 13 or args.init_checkpoint:
                 config = model.model_config.model_dump()
                 config['group_detr'] = args.rf_groups
+                if args.init_checkpoint:
+                    config.update(pretrain_weights=str(args.init_checkpoint.resolve()), num_classes=len(classes))
                 model = type(model)(**config)
                 del wrapper
+            model.model.resolution = args.resolution or 560
             if args.channels_last:
                 model.model.model.to(memory_format=torch.channels_last)
             recipe = dict(dataset_dir=str(native_data), epochs=args.epochs or 30,
@@ -128,7 +144,7 @@ def main(argv=None):
                 lr_encoder=args.backbone_lr, output_dir=str(output), warmup_epochs=args.warmup_ratio*(args.epochs or 30),
                 early_stopping=True, early_stopping_patience=args.patience, tensorboard=True, amp=args.amp,
                 num_workers=args.workers, multi_scale=False, expanded_scales=False,
-                use_ema=False, run_test=False, resolution=560, seed=args.seed)
+                use_ema=False, run_test=False, resolution=args.resolution or 560, seed=args.seed)
             recipe['group_detr'] = args.rf_groups
             if args.resume:
                 recipe['resume'] = str(args.resume)
@@ -162,7 +178,8 @@ def append_history(output, record):
 
 def map_metrics(result, classes, label_offset=0):
     """Convert TorchMetrics results into scalar fields, including class AP."""
-    values = {key: float(result[key]) for key in ['map', 'map_50', 'map_75', 'mar_100']}
+    values = {key: float(result[key]) for key in ['map', 'map_50', 'map_75',
+                                                'map_small', 'map_medium', 'map_large', 'mar_100']}
     ids = result.get('classes')
     per_class = result.get('map_per_class')
     if ids is not None and per_class is not None:
@@ -190,7 +207,7 @@ def save_previews(output, samples, classes, progress, confidence=0.3):
         draw = ImageDraw.Draw(canvas)
         for panel, (name, payload, color) in enumerate([
             ('Ground truth', sample['target'], '#45df91'),
-            (f'Predictions (score ≥ {confidence:g})', sample['prediction'], '#ffbb54')]):
+            (f'Predictions (score >= {confidence:g})', sample['prediction'], '#ffbb54')]):
             offset = panel * size[0]
             canvas.paste(thumbnail, (offset, 34))
             draw.text((offset + 8, 7), name, fill=color, font=font)
@@ -304,6 +321,11 @@ class CocoDataset:
         image = Image.open(im['filepath']).convert('RGB')
         anns = clipped_annotations(im, self.data['annotations'][im['id']])
         if self.processor is not None:
+            if self.augment:
+                if torch.rand(1).item() < .5:
+                    image = F.hflip(image)
+                    anns = [{**a, 'bbox': [im['width']-a['bbox'][0]-a['bbox'][2], *a['bbox'][1:]]} for a in anns]
+                image = ColorJitter(brightness=(.8,1.2), contrast=(.8,1.2), saturation=(.8,1.2))(image)
             anns = [{**a, 'category_id': self.data['category_to_index'][a['category_id']]} for a in anns]
             encoded = self.processor(images=image, annotations={'image_id': im['id'], 'annotations': anns}, return_tensors='pt')
             return {k: v[0] for k, v in encoded.items()}
@@ -331,6 +353,9 @@ def train_torchvision(family, args, output, classes):
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(str(output / 'tensorboard'))
     model = replace_torchvision_head(wrapper._model, family, len(classes)).to(args.device)
+    if args.resolution:
+        model.transform.min_size = (args.resolution,)
+        model.transform.max_size = round(args.resolution*1333/800)
     if args.channels_last:
         model.to(memory_format=torch.channels_last)
     steps = args.max_steps or 50000
@@ -339,6 +364,7 @@ def train_torchvision(family, args, output, classes):
               'momentum': 0.9, 'weight_decay': 0.0001,
               'grad_accum_steps': args.grad_accum_steps or 1, 'amp': args.amp, 'precision': args.precision}
     recipe['eval_score_threshold'] = model.score_thresh if family == 'retinanet' else model.roi_heads.score_thresh
+    recipe.update(min_size=list(model.transform.min_size), max_size=model.transform.max_size)
     dtype = torch.bfloat16 if args.precision == 'bf16' else torch.float16
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp and args.precision == 'fp16')
     write_model_info(output, model, classes, recipe)
@@ -405,8 +431,7 @@ def train_torchvision(family, args, output, classes):
             seen = 0
             with torch.no_grad():
                 for images, targets in val_loader:
-                    with torch.autocast('cuda', dtype=dtype, enabled=args.amp and args.device == 'cuda'):
-                        predictions = model([im.to(args.device, non_blocking=True).float().div_(255) for im in images])
+                    predictions = model([im.to(args.device, non_blocking=True).float().div_(255) for im in images])
                     cpu_predictions = [{k: v.float().cpu() if v.is_floating_point() else v.cpu()
                                         for k, v in p.items()} for p in predictions]
                     metric.update(cpu_predictions, list(targets))
@@ -463,23 +488,28 @@ class TransformerCollator:
 
 
 def train_transformer(family, args, output, classes):
-    from transformers import (AutoImageProcessor, AutoModelForObjectDetection, Trainer,
+    from transformers import (AutoConfig, AutoImageProcessor, AutoModelForObjectDetection, Trainer,
                               TrainingArguments, EarlyStoppingCallback)
     from transformers import TrainerCallback
     import torch
-    from torchvision.ops import box_convert
     source = MODELS[family].source
     # Use the Zoo's matching HF configuration; changing class count replaces the head.
-    wrapper = load_pretrained(family, args.device)
-    labels = dict(wrapper._model.config.id2label)
-    old_heads = {k:v.detach().cpu() for k,v in wrapper._model.state_dict().items()
-                 if any(s in k for s in ['class_embed','enc_score_head','class_labels_classifier'])} if args.semantic_init else {}
-    config = wrapper._model.config
+    if args.init_checkpoint:
+        source = str(args.init_checkpoint.resolve())
+        config = AutoConfig.from_pretrained(source)
+        assert list(config.id2label.values()) == classes
+        old_heads = {}
+    else:
+        wrapper = load_pretrained(family, args.device)
+        labels = dict(wrapper._model.config.id2label)
+        old_heads = {k:v.detach().cpu() for k,v in wrapper._model.state_dict().items()
+                     if any(s in k for s in ['class_embed','enc_score_head','class_labels_classifier'])} if args.semantic_init else {}
+        config = wrapper._model.config
+        del wrapper
     config.id2label = dict(enumerate(classes))
     config.label2id = {name: i for i, name in enumerate(classes)}
-    del wrapper
     model = AutoModelForObjectDetection.from_pretrained(source, config=config, ignore_mismatched_sizes=True)
-    if args.semantic_init:
+    if args.semantic_init and not args.init_checkpoint:
         groups = {'Vehicle':{'car','bus','truck'}, 'VulnerableVehicle':{'bicycle','motorcycle','motorbike'}, 'Pedestrian':{'person'}}
         indices = [[i for i,label in labels.items() if label.lower() in groups[name]] for name in classes]
         assert all(indices)
@@ -497,13 +527,16 @@ def train_transformer(family, args, output, classes):
         model.to(memory_format=torch.channels_last)
     processor = AutoImageProcessor.from_pretrained(source)
     # Keep each processor's expected sizing schema (DETR vs real-time DETRs).
-    processor.size = ({'shortest_edge': 512, 'longest_edge': 864}
-                      if 'shortest_edge' in processor.size else {'height': 512, 'width': 512})
+    resolution = args.resolution or 512
+    processor.size = ({'shortest_edge': resolution, 'longest_edge': round(resolution*864/512)}
+                      if 'shortest_edge' in processor.size else {'height': resolution, 'width': resolution})
     recipe = {'epochs': args.epochs or 30, 'batch_size': args.batch_size or 4,
               'grad_accum_steps': args.grad_accum_steps or 4, 'lr': args.lr or 1e-4, 'backbone_lr': args.backbone_lr,
-              'patience': args.patience, 'resolution': 512, 'amp': args.amp, 'precision': args.precision,
+              'patience': args.patience, 'resolution': resolution, 'amp': args.amp, 'precision': args.precision,
               'semantic_init': args.semantic_init, 'channels_last': args.channels_last,
-              'selection_metric': 'validation_map'}
+              'augment': args.augment,
+              'selection_metric': 'validation_map', 'evaluation_ground_truth': 'source COCO with crowd ignore',
+              'evaluation_confidence_floor': .001}
     write_model_info(output, model, classes, recipe)
     training_args = TrainingArguments(output_dir=str(output), num_train_epochs=recipe['epochs'],
         per_device_train_batch_size=recipe['batch_size'], per_device_eval_batch_size=recipe['batch_size'],
@@ -551,19 +584,27 @@ def train_transformer(family, args, output, classes):
 
         def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
             inputs = self._prepare_inputs(inputs)
-            with torch.no_grad(), self.compute_loss_context_manager():
-                outputs = model(**inputs)
+            native = self.accelerator.unwrap_model(model)
+            # Bypass Accelerate's AMP wrapper for validation box coordinates.
+            forward = getattr(native, '_original_forward', native.forward)
+            with torch.no_grad(), torch.autocast('cuda', enabled=False):
+                outputs = forward(**inputs)
             labels = inputs['labels']
             sizes = torch.stack([target['orig_size'] for target in labels])
-            predictions = processor.post_process_object_detection(outputs, target_sizes=sizes, threshold=0.)
+            predictions = processor.post_process_object_detection(outputs, target_sizes=sizes, threshold=.001)
             targets = []
-            for target, size in zip(labels, sizes):
-                h, w = size.unbind()
-                scale = torch.stack([w, h, w, h])
-                boxes = box_convert(target['boxes'], 'cxcywh', 'xyxy') * scale
-                targets.append({'boxes': boxes.cpu(), 'labels': target['class_labels'].cpu()})
+            for i in range(len(labels)):
+                im = val_dataset.data['images'][self.validation_seen+i]
+                anns = clipped_annotations(im, val_dataset.data['annotations'][im['id']])
+                boxes = [[x,y,x+w,y+h] for x,y,w,h in [a['bbox'] for a in anns]]
+                targets.append({'boxes': torch.tensor(boxes,dtype=torch.float32).reshape(-1,4),
+                    'labels': torch.tensor([val_dataset.data['category_to_index'][a['category_id']] for a in anns]).long(),
+                    'area': torch.tensor([a['area'] for a in anns]),
+                    'iscrowd': torch.tensor([a.get('iscrowd',0) for a in anns])})
             predictions = [{k: v.detach().float().cpu() if k != 'labels' else v.detach().cpu()
                             for k, v in prediction.items()} for prediction in predictions]
+            for prediction in predictions:
+                prediction['boxes'][:,2:] = torch.maximum(prediction['boxes'][:,2:], prediction['boxes'][:,:2])
             self.detection_metric.update(predictions, targets)
             for i, prediction in enumerate(predictions):
                 if len(self.preview_samples) < 4:
@@ -575,7 +616,7 @@ def train_transformer(family, args, output, classes):
             return outputs.loss.detach().mean(), None, None
 
     trainer = DetectionTrainer(model=model, args=training_args,
-        train_dataset=CocoDataset(args.coco_dir, 'train', args.image_root, processor=processor),
+        train_dataset=CocoDataset(args.coco_dir, 'train', args.image_root, processor=processor, augment=args.augment),
         eval_dataset=val_dataset,
         data_collator=TransformerCollator(processor), callbacks=[HistoryCallback(), EarlyStoppingCallback(early_stopping_patience=args.patience)])
     trainer.train(resume_from_checkpoint=str(args.resume) if args.resume else None)

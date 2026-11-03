@@ -1,0 +1,46 @@
+{
+  "pid": 1673899,
+  "command": [
+    "/home/felix/JEPA-Assessors-OD/.venv/bin/python",
+    "-u",
+    "-m",
+    "src.assessors.run",
+    "--prepare-targets",
+    "--extract-features",
+    "--features",
+    "data/assessors/features/224x448-grid2x4",
+    "--detectors",
+    "yolo",
+    "rf-detr",
+    "--encoders",
+    "resnet18",
+    "resnet50",
+    "mobilenet_v3_small",
+    "convnext_tiny",
+    "dinov2",
+    "siglip2",
+    "mae",
+    "--seeds",
+    "43"
+  ],
+  "detectors": [
+    "yolo",
+    "rf-detr"
+  ],
+  "encoders": [
+    "resnet18",
+    "resnet50",
+    "mobilenet_v3_small",
+    "convnext_tiny",
+    "dinov2",
+    "siglip2",
+    "mae"
+  ],
+  "excluded": {
+    "dinov3": "Hugging Face gated access denied"
+  },
+  "target": "1 - LRP",
+  "assessor_test_evaluation": false,
+  "seed": 43,
+  "stage": "frozen feature screening"
+}

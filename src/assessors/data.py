@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from torchvision.transforms.functional import pil_to_tensor
 
 from src.data.dataset import ROOT
 
@@ -21,15 +22,22 @@ def read_data(folder):
 
 
 class Images(Dataset):
-    def __init__(self, rows):
+    def __init__(self, rows, tensors=False):
         self.rows = rows.reset_index(drop=True)
+        self.tensors = tensors
 
     def __len__(self):
         return len(self.rows)
 
     def __getitem__(self, index):
         row = self.rows.iloc[index]
-        return Image.open(row.filepath).convert('RGB'), int(row.image_id)
+        with Image.open(row.filepath) as source:
+            image = source.convert('RGB')
+        return (pil_to_tensor(image) if self.tensors else image), int(row.image_id)
+
+
+def collate_samples(batch):
+    return tuple(zip(*batch))
 
 
 class ImageBatch:

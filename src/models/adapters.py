@@ -34,6 +34,7 @@ def replace_torchvision_head(model, family, num_classes):
     if family == 'faster-rcnn':
         from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
         model.roi_heads.box_predictor = FastRCNNPredictor(model.roi_heads.box_predictor.cls_score.in_features, num_classes + 1)
+        model.roi_heads.score_thresh = .001
     else:
         from torchvision.models.detection.retinanet import RetinaNetClassificationHead
         tower = model.head.classification_head.conv.state_dict()
@@ -83,12 +84,16 @@ def load_finetuned(artifact, device):
         class LocalRFDETRModel(RFDETRDetectionModel):
             def _load_model(self, config):
                 return NativeRFDETR(pretrain_weights=str(checkpoint), device=device,
+                    num_classes=len(classes), resolution=manifest['settings']['recipe'].get('resolution', 560),
                     group_detr=manifest['settings']['recipe'].get('group_detr', 13))
         model = LocalRFDETRModel(RFDETRDetectionModelConfig({'model_type': MODELS[family].source, 'device': device}))
     else:
         import torch
         from fiftyone.utils.torch import TorchImageModel, TorchImageModelConfig
         native = build_torchvision(family, len(classes))
+        recipe = manifest['settings']['recipe']
+        native.transform.min_size = tuple(recipe.get('min_size', native.transform.min_size))
+        native.transform.max_size = recipe.get('max_size', native.transform.max_size)
         state = torch.load(checkpoint, map_location='cpu', weights_only=True)
         native.load_state_dict(state['model'])
         model = TorchImageModel(TorchImageModelConfig({'model': native,
@@ -111,3 +116,79 @@ def save_manifest(output_dir, family, classes, checkpoint, settings):
     temporary = output / 'manifest.json.tmp'
     temporary.write_text(json.dumps(manifest, indent=2))
     temporary.replace(output / 'manifest.json')
+
+
+def set_resolution(model, family, resolution):
+    backend = MODELS[family].backend
+    if backend == 'ultralytics':
+        predictor = model._model.predictor
+        predictor.args.imgsz = resolution
+        predictor.imgsz = [resolution, resolution]
+        predictor.args.rect = True
+    elif backend == 'rfdetr':
+        model._model.model.resolution = resolution
+    elif backend == 'transformers':
+        processor = model.transforms.processor
+        processor.size = ({'shortest_edge': resolution, 'longest_edge': round(resolution*864/512)}
+                          if 'shortest_edge' in processor.size else {'height': resolution, 'width': resolution})
+    else:
+        model._model.transform.min_size = (resolution,)
+        model._model.transform.max_size = round(resolution*1333/800)
+
+
+def batch_predictor(family, artifact, resolution):
+    import torch
+    from torchvision.transforms.functional import pil_to_tensor
+
+    manifest = json.loads((artifact/'manifest.json').read_text())
+    checkpoint = artifact/manifest['checkpoint']
+    if family == 'yolo':
+        from ultralytics import YOLO
+        model = YOLO(checkpoint)
+        def predict(images):
+            results = model.predict(images, imgsz=resolution, conf=.001, iou=.7, max_det=300,
+                                   half=False, device='cuda', verbose=False)
+            return [{'boxes': r.boxes.xyxy, 'scores': r.boxes.conf, 'labels': r.boxes.cls.long()} for r in results]
+    elif family == 'rf-detr':
+        import rfdetr
+        model = rfdetr.RFDETRLarge(pretrain_weights=str(checkpoint), device='cuda', num_classes=3,
+                                  group_detr=manifest['settings']['recipe'].get('group_detr', 13))
+        model.model.resolution = resolution
+        def predict(images):
+            with torch.autocast('cuda', enabled=False):
+                results = model.predict(images, threshold=.001)
+            predictions = []
+            for result in results:
+                keep = result.class_id < 3
+                predictions.append({'boxes': torch.as_tensor(result.xyxy[keep]),
+                    'scores': torch.as_tensor(result.confidence[keep]),
+                    'labels': torch.as_tensor(result.class_id[keep]).long()})
+            return predictions
+    elif MODELS[family].backend == 'transformers':
+        from transformers import AutoImageProcessor, AutoModelForObjectDetection
+        model = AutoModelForObjectDetection.from_pretrained(checkpoint).cuda().eval()
+        processor = AutoImageProcessor.from_pretrained(checkpoint)
+        processor.size = ({'shortest_edge': resolution, 'longest_edge': round(resolution*864/512)}
+                          if 'shortest_edge' in processor.size else {'height': resolution, 'width': resolution})
+        def predict(images):
+            inputs = processor(images=images, return_tensors='pt').to('cuda')
+            with torch.autocast('cuda', enabled=False):
+                result = model(**inputs)
+            return processor.post_process_object_detection(result, threshold=.001,
+                target_sizes=torch.tensor([[im.height, im.width] for im in images], device='cuda'))
+    else:
+        model = build_torchvision(family, 3)
+        model.load_state_dict(torch.load(checkpoint, map_location='cpu', weights_only=True)['model'])
+        model = model.cuda().eval()
+        if family == 'faster-rcnn':
+            model.roi_heads.score_thresh = .001
+        def predict(images):
+            with torch.autocast('cuda', enabled=False):
+                results = model([pil_to_tensor(im).cuda().float()/255 for im in images])
+            predictions = []
+            for result in results:
+                keep = result['labels'] > 0
+                predictions.append({k: v[keep] - 1 if k == 'labels' else v[keep] for k,v in result.items()})
+            return predictions
+    return predict
+

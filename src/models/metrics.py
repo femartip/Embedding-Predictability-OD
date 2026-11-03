@@ -5,9 +5,7 @@ from typing import Iterable, Sequence
 import torch
 from torch import Tensor
 from torchmetrics import Metric
-from torchmetrics.detection import MeanAveragePrecision, IntersectionOverUnion
 from torchvision.ops import box_convert, box_iou
-import numpy as np
 
 class LocalizationRecallPrecision(Metric):
     """TorchMetrics-compatible implementation of the Localization Recall Precision (LRP) error."""
@@ -146,78 +144,14 @@ class LocalizationRecallPrecision(Metric):
         return tensor_labels
 
 
-@torch.no_grad()
-def matched_iou(preds, targets):
-    all_ious = []
-    n_images = max(len(preds), len(targets))
-
-    for i in range(n_images):
-        p = preds[i] if i < len(preds) else {"boxes": torch.zeros((0, 4)), "labels": torch.zeros(0, dtype=torch.long), "scores": torch.zeros(0)}
-        t = targets[i] if i < len(targets) else {"boxes": torch.zeros((0, 4)), "labels": torch.zeros(0, dtype=torch.long)}
-        if p["boxes"].numel() == 0 or t["boxes"].numel() == 0:
-            all_ious.extend([0.0] * max(len(p["boxes"]), len(t["boxes"])))
-            continue
-
-        p_boxes = p["boxes"].float()
-        p_labels = p["labels"].long()
-        p_scores = p["scores"].float()
-        t_boxes = t["boxes"].float()
-        t_labels = t["labels"].long()
-
-        classes = torch.cat([p_labels, t_labels]).unique()
-        for c in classes.tolist():
-            det_mask = (p_labels == c)
-            gt_mask  = (t_labels == c)
-            det_count = int(det_mask.sum().item())
-            gt_count = int(gt_mask.sum().item())
-
-            if det_count == 0:
-                all_ious.extend([0.0] * gt_count)
-                continue
-            if gt_count == 0:
-                all_ious.extend([0.0] * det_count)
-                continue
-
-            d_boxes = p_boxes[det_mask]
-            d_scores = p_scores[det_mask]
-            g_boxes = t_boxes[gt_mask]
-
-            order = torch.argsort(d_scores, descending=True) # sort detections by confidence desc 
-            d_boxes = d_boxes[order]
-            ious = box_iou(d_boxes, g_boxes) 
-            gt_taken = torch.zeros(g_boxes.size(0), dtype=torch.bool, device=ious.device)
-
-            for di in range(ious.size(0)):
-                iou_row = ious[di].masked_fill(gt_taken, -1.0) # ignore already taken GT
-                best_iou, best_j = torch.max(iou_row, dim=0)
-                if best_iou > 0.0: #TP
-                    all_ious.append(best_iou.item())
-                    gt_taken[best_j] = True 
-                else:
-                    #FP asigned to 0 IoU
-                    all_ious.append(0.0)
-
-            #FN asigned to 0 IoU
-            fn_count = int((~gt_taken).sum().item())
-            if fn_count:
-                all_ious.extend([0.0] * fn_count)
-    if len(all_ious) == 0:
-        return 1.0
-    return float(sum(all_ious) / len(all_ious))
-
-
 def get_metrics(detections: list[dict], annotations: list[dict], metrics: list | None) -> dict:
     if metrics is None:
-        metrics = ["iou"]
-    allowed = {"lrp", "iou"}
+        metrics = ["lrp"]
+    allowed = {"lrp"}
     assert all(m in allowed for m in metrics), f"Unsupported metric(s): {set(metrics) - allowed}"
 
     results = {}
 
-    if "iou" in metrics:
-        iou_out = matched_iou(detections, annotations)
-        results["iou"] = iou_out
-    
     if "lrp" in metrics:
         lrp_metric = LocalizationRecallPrecision(tau=0.5, box_format="xyxy")
         lrp_metric.update(detections, annotations)
@@ -225,31 +159,3 @@ def get_metrics(detections: list[dict], annotations: list[dict], metrics: list |
         results["lrp"] = 1.0 - float(lrp_out)  # higher is better
 
     return results
-
-
-if __name__ == "__main__":
-    detections = [
-        {
-            "boxes": torch.tensor([[1, 1, 2, 2]], dtype=torch.float32),
-            "labels": torch.tensor([1], dtype=torch.long),
-            "scores": torch.tensor([0.9]),
-        },
-        {
-            "boxes": torch.tensor([[10, 10, 12, 12]], dtype=torch.float32),
-            "labels": torch.tensor([1], dtype=torch.long),
-            "scores": torch.tensor([0.8]),
-        },
-    ]
-    annotations = [
-        {
-            "boxes": torch.tensor([[1, 1, 2, 2]], dtype=torch.float32),
-            "labels": torch.tensor([1], dtype=torch.long),
-        },
-        {
-            "boxes": torch.tensor([[5, 5, 7, 7]], dtype=torch.float32),
-            "labels": torch.tensor([1], dtype=torch.long),
-        },
-    ]
-
-    metrics = get_metrics(detections, annotations, metrics=["iou", "lrp"])
-    print(metrics)

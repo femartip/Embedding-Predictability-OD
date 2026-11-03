@@ -148,6 +148,38 @@ poetry run python src/models/finetune_all.py \
   --recipes data/tuning/recipes.json --artifacts-dir models/tuned --log-dir logs/finetune-tuned
 ```
 
+Accuracy diagnostics and short recovery pilots are separate from the final panel:
+
+```bash
+poetry run python src/models/hyperparam_tuning/accuracy.py --phase all
+```
+
+This uses fixed subsets of 2,048 training and 512 validation images (seed 89),
+with no test images. It audits class/size AP and examples, compares YOLO 512/768
+and RF-DETR 560/840, and tests lower head learning rates and backbone adaptation
+for the Hugging Face models. Tables and figures go to `results/detector_accuracy/`,
+pilots to `models/tuning/accuracy/`, and logs to `logs/tuning/accuracy/`.
+An additional D-FINE pilot tests 768-pixel inputs with light image augmentation.
+Use `--phase audit`, `sweep`, `pilots`, or `summary` to run one stage. The sweep
+checks additional inference sizes without training. Pilots are 2–3 epoch
+continuations from the completed checkpoints, not full retraining. `--resolution`
+sets input size; `--init-checkpoint` loads weights without optimizer state.
+Validation uses FP32 in the RF-DETR, Torchvision, and HF training adapters;
+training can still use AMP. HF validation reads the original COCO ground truth
+so crowd regions remain ignored. Inference also accepts `--resolution` and records
+the override in prediction metadata. The archived BF16/FP16 audit comparisons
+are separate from the FP32 accuracy measurements.
+
+Validate the seven selected configurations on the complete validation split:
+
+```bash
+poetry run python src/models/hyperparam_tuning/accuracy.py --phase full-validation --batch-size 16 --workers 4
+```
+
+Selection is frozen in `results/detector_accuracy/full_validation/selection.csv`.
+That folder contains progress/status, full AP tables and figures, and streamed
+per-image predictions (`*.jsonl`). Completed models are skipped on reruns.
+
 The selected YOLO recipe starts a new optimizer schedule from its preserved
 checkpoint. `--init-checkpoint` loads weights; `--resume` restores optimizer state.
 Final outputs are separate from pilots and the original run. The queue skips
@@ -180,7 +212,7 @@ temporary datasets are deleted afterward.
 
 Fine-tuned test outputs retain the existing feature-merger paths:
 
-- `results/<family>/detections.json`: per-image `iou`, `lrp` (the existing
+- `results/<family>/detections.json`: per-image `lrp` (the existing
   **1 − LRP error** score, so higher is better), and confidence values.
 - `results/<family>/predictions.json`: boxes, scores, and zero-based ZOD labels.
 - `results/<family>/predictions.meta.json`: model, artifact, split, class order,
@@ -228,15 +260,15 @@ training diagnostics and checkpoint selection.
 Predict a frozen detector's per-image performance from the image alone. Detector
 outputs and ground truth construct training targets; neither is an assessor input.
 
-- **Targets:** retain the existing mean matched IoU with zeros for unmatched
-  predictions/objects, and compare it with `1 - LRP error` (both higher is better).
+- **Target:** only `1 - LRP error`, stored as `lrp` (higher is better).
   LRP combines normalized localization error, false positives and false negatives
-  at an explicit IoU matching threshold; it is not universally preferable to the
-  existing score. Audit matching, empty-image cases and ignored annotations first.
+  at an IoU matching threshold of 0.5. Both-empty images score 1 by convention.
+  Audit matching, empty-image cases and ignored annotations first.
   Select confidence thresholds using detector validation data and freeze them.
 - **Splits:** freeze detector checkpoints, then audit prior use of the 9,667
   detector-test images before repurposing them into approximately 60/20/20
-  assessor train/validation/test splits, grouped by geography or drive. Save one
+  assessor train/validation/test splits, grouped by geography or drive. The saved
+  split has 5,499/2,092/2,076 images, with disjoint geographic tiles. Save one
   split for all methods; fit preprocessing only on assessor training data. This
   repurposes the original test pool rather than creating a new independent set.
 - **Encoders:** ImageNet-pretrained ResNet-18, ResNet-50, MobileNetV3-Small and
@@ -248,10 +280,18 @@ outputs and ground truth construct training targets; neither is an assessor inpu
   fully fine-tune shortlisted encoders on performance scores, keeping their heads
   fixed in design. Start with one completed detector, then expand across families
   and compare separate assessors with a shared encoder and detector-specific heads.
-- **Evaluation:** report score MAE, R², Spearman correlation, risk–coverage curves,
+- **Evaluation:** report R², ECE against continuous validity scores (25 equal-width
+  predicted score bins), MAE, Spearman correlation, risk–coverage curves and AURC,
   training/validation curves, predicted-versus-measured plots and label-budget
   learning curves. Include constant and image-quality baselines, repeat shortlisted
   runs with multiple seeds, and estimate uncertainty by geographic/drive groups.
+  ECE compares mean predicted and measured image validity within each bin,
+  weighted by the fraction of images in that bin. AURC averages detection error
+  (LRP) as increasingly many images are accepted in descending predicted validity;
+  lower is better. Save reliability plots and bin tables. Calibration alone does
+  not establish predictability; a constant predictor can have a small binned error.
+  Screening evaluates assessor validation only; `--evaluate-test` explicitly adds
+  final test evaluation after configurations are fixed.
 
 The current three-class annotation filters define the study's scope. Difficulty-
 changing augmentations require recomputed detector targets. New JEPA objectives
@@ -263,8 +303,15 @@ Metric references: [LRP, ECCV 2018](https://arxiv.org/abs/1807.01696) and
 The implementation is under `src/assessors/`. Run from the repository root:
 
 ```bash
+# End-to-end frozen baseline screen using the validated detector selections
+# DINOv3 can be added once the configured Hugging Face account has model access
+poetry run python -m src.assessors.run --prepare-targets --extract-features \
+  --features data/assessors/features/224x448-grid2x4 --detectors yolo rf-detr \
+  --encoders resnet18 resnet50 mobilenet_v3_small convnext_tiny dinov2 siglip2 mae
+
 # Generate predictions from completed detector artifacts, retaining low scores for calibration
-poetry run python src/models/run_inference.py yolo --validate --test --confidence-threshold 0.01
+poetry run python src/models/run_inference.py yolo models/tuned/yolo \
+  --resolution 1280 --validate --test --confidence-threshold 0.01
 
 # Build one reusable geographic split and targets; supply all detector files when rebuilding targets
 poetry run python -m src.assessors.prepare \
@@ -275,14 +322,14 @@ poetry run python -m src.assessors.prepare \
 # Cache features; add the remaining encoder aliases when ready
 poetry run python -m src.assessors.features --encoders resnet18 resnet50 convnext_tiny
 
-# Screen both target scores, constant/image-quality baselines, ridge and MLP assessors
+# Screen 1-LRP, constant/image-quality baselines, ridge and MLP assessors
 poetry run python -m src.assessors.run --detectors yolo \
   --features data/assessors/features/224x448-grid2x4 \
   --encoders resnet18 resnet50 convnext_tiny
 
 # Fine-tune a shortlisted encoder, keeping the MLP architecture unchanged
 poetry run python -m src.assessors.train --encoder resnet18 --mode partial \
-  --pool spatial --detectors yolo --target iou --seeds 43 44 45 --fractions 0.1 0.25 0.5 1
+  --pool spatial --detectors yolo --seeds 43 44 45 --fractions 0.1 0.25 0.5 1
 poetry run python -m src.assessors.run --report-only
 ```
 
@@ -298,6 +345,11 @@ be run directly with `train --features <file.npz> --regressor ridge|mlp`.
 Models, histories and predictions go to `models/assessors/`; comparison tables,
 group-bootstrap MAE intervals and diagnostic plots go to `results/assessors/`.
 All PNG figures and CSV tables are saved directly in that folder, without HTML.
+The end-to-end runner writes `results/assessors/status.json`, reuses the frozen
+full-validation predictions, and generates source-coordinate assessor-pool
+predictions under `data/assessors/predictions/`. Threshold selection maximizes mean
+per-image validation `1 - LRP` over the specified confidence grid. Completed feature
+caches and assessor runs are skipped on reruns with the same inputs.
 Use `--results` to choose another folder; `--output` selects the saved model runs.
 `--seeds` and `--fractions` also work in the screening runner. Existing run folders
 are not overwritten; use a different `--output` directory for another experiment.

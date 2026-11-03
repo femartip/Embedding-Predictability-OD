@@ -1,5 +1,0 @@
-{
-    "nms_iou": 0.7,
-    "num_classes": 3,
-    "model": "yolo"
-}

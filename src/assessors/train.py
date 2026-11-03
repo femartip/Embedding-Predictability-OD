@@ -109,13 +109,21 @@ def run(args, detectors, seed, fraction):
         name = 'constant'
     tag = f'{name}-{args.mode}-{args.regressor}-{args.target}-{"+".join(detectors)}-s{seed}-n{fraction:g}'
     output = args.output / tag
+    if (output / 'config.json').exists():
+        saved = json.loads((output / 'config.json').read_text())
+        assert saved['evaluate_test'] == args.evaluate_test
+        assert saved['split_sha256'] == hashlib.file_digest(open(args.data / 'images.csv', 'rb'), 'sha256').hexdigest()
+        assert saved['target_sha256'] == hashlib.file_digest(open(args.data / 'targets.csv', 'rb'), 'sha256').hexdigest()
+        print('Completed:', output, flush=True)
+        return
     output.mkdir(parents=True)
-    indices = {split: np.flatnonzero(rows.split == split) for split in ['train', 'val', 'test']}
+    evaluation = ['val', 'test'] if args.evaluate_test else ['val']
+    indices = {split: np.flatnonzero(rows.split == split) for split in ['train', *evaluation]}
     y = rows[labels.columns].to_numpy(dtype=np.float32)
     if args.regressor in ['constant', 'ridge']:
         if args.regressor == 'constant':
             mean = y[indices['train']].mean(0)
-            predictions = {s: np.broadcast_to(mean, (len(indices[s]), len(detectors))) for s in ['val', 'test']}
+            predictions = {s: np.broadcast_to(mean, (len(indices[s]), len(detectors))) for s in evaluation}
             joblib.dump(mean, output / 'regressor.pkl')
         else:
             candidates = []
@@ -125,7 +133,7 @@ def run(args, detectors, seed, fraction):
                 error = mean_absolute_error(y[indices['val']], model.predict(features[indices['val']]).clip(0, 1))
                 candidates.append((error, alpha, model))
             _, alpha, model = min(candidates, key=lambda t: t[0])
-            predictions = {s: model.predict(features[indices[s]]).clip(0, 1).reshape(-1, len(detectors)) for s in ['val', 'test']}
+            predictions = {s: model.predict(features[indices[s]]).clip(0, 1).reshape(-1, len(detectors)) for s in evaluation}
             joblib.dump(model, output / 'regressor.pkl')
             write_json(output / 'selection.json', {'alpha': alpha, 'validation_mae': [float(c[0]) for c in candidates]})
     else:
@@ -170,7 +178,8 @@ def main():
     source.add_argument('--encoder', choices=ENCODERS)
     p.add_argument('--detectors', nargs='+', required=True)
     p.add_argument('--shared', action='store_true')
-    p.add_argument('--target', choices=['iou', 'lrp', 'fp_rate', 'fn_rate', 'localization_error'], default='iou')
+    p.add_argument('--target', choices=['lrp'], default='lrp', help='1 - LRP error')
+    p.add_argument('--evaluate-test', action='store_true', help='Also evaluate test after fixing the experiment configuration')
     p.add_argument('--regressor', choices=['constant', 'ridge', 'mlp'], default='mlp')
     p.add_argument('--mode', choices=['frozen', 'partial', 'full'], default='frozen')
     p.add_argument('--pool', choices=['global', 'mean', 'spatial'], default='global')

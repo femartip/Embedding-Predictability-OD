@@ -239,5 +239,7 @@ data/assessors/
 data/tuning/
 models/tuning/
 models/tuned/
+# Generated detector accuracy outputs
+results/detector_accuracy/
 reports/tuning/
 reports/finetuning-tuned/

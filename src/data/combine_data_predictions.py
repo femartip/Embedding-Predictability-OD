@@ -19,7 +19,6 @@ def combine_results(data: pd.DataFrame, predictions: dict) -> pd.DataFrame:
             continue
 
         instance_dict = instance.to_dict()
-        instance_dict["iou"] = prediction["iou"] 
         instance_dict["lrp"] = prediction["lrp"]
         
         results[id_int] = instance_dict

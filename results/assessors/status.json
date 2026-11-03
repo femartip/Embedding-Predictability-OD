@@ -1,0 +1,17 @@
+{
+  "phase": "targets",
+  "detectors": [
+    "yolo",
+    "rf-detr"
+  ],
+  "encoders": [
+    "resnet18",
+    "resnet50",
+    "mobilenet_v3_small",
+    "convnext_tiny",
+    "dinov2",
+    "siglip2",
+    "mae"
+  ],
+  "evaluate_test": false
+}
