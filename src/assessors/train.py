@@ -25,13 +25,17 @@ def to_device(x, device):
     return {k: v.to(device) for k, v in x.items()} if isinstance(x, dict) else x.to(device)
 
 
-def predict(model, loader, device):
+def predict(model, loader, device, with_targets=False):
     model.eval()
     predictions = []
+    targets = []
     with torch.no_grad():
-        for x, _ in loader:
+        for x, y in loader:
             predictions.append(model(to_device(x, device)).cpu().numpy())
-    return np.concatenate(predictions)
+            if with_targets:
+                targets.append(y.numpy())
+    values = np.concatenate(predictions)
+    return (values, np.concatenate(targets)) if with_targets else values
 
 
 class Assessor(nn.Module):
@@ -60,16 +64,20 @@ def fit_neural(model, loaders, args, output):
         total, count = 0., 0
         for x, y in loaders['train']:
             x, y = to_device(x, args.device), y.to(args.device)
-            optimizer.zero_grad()
-            loss = nn.functional.mse_loss(model(x), y)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(args.device.split(':')[0], dtype=torch.bfloat16, enabled=args.amp):
+                loss = nn.functional.mse_loss(model(x).float(), y)
+            assert torch.isfinite(loss)
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad, error_if_nonfinite=True)
             optimizer.step()
             total += loss.item()*len(y)
             count += len(y)
-        values = predict(model, loaders['val'], args.device)
-        truth = np.concatenate([y.numpy() for _, y in loaders['val']])
+        values, truth = predict(model, loaders['val'], args.device, with_targets=True)
         error = mean_absolute_error(truth, values)
-        history.append({'epoch': epoch+1, 'train_mse': total/count, 'val_mae': error})
+        history.append({'epoch': epoch+1, 'train_mse': total/count, 'val_mae': error,
+                        'prediction_std': float(values.std()),
+                        'boundary_fraction': float(((values < .001) | (values > .999)).mean())})
         pd.DataFrame(history).to_csv(output / 'history.csv', index=False)
         print(output.name, history[-1], flush=True)
         if error < best:
@@ -114,6 +122,8 @@ def run(args, detectors, seed, fraction):
         assert saved['evaluate_test'] == args.evaluate_test
         assert saved['split_sha256'] == hashlib.file_digest(open(args.data / 'images.csv', 'rb'), 'sha256').hexdigest()
         assert saved['target_sha256'] == hashlib.file_digest(open(args.data / 'targets.csv', 'rb'), 'sha256').hexdigest()
+        for key in ['lr', 'encoder_lr', 'epochs', 'batch_size', 'head_init', 'clip_grad', 'amp', 'alphas']:
+            assert saved.get(key) == getattr(args, key), f'{key} changed: choose a new output directory'
         print('Completed:', output, flush=True)
         return
     output.mkdir(parents=True)
@@ -127,7 +137,7 @@ def run(args, detectors, seed, fraction):
             joblib.dump(mean, output / 'regressor.pkl')
         else:
             candidates = []
-            for alpha in [.1, 1., 10., 100.]:
+            for alpha in args.alphas:
                 model = make_pipeline(StandardScaler(), Ridge(alpha=alpha, solver='lsqr'))
                 model.fit(features[indices['train']], y[indices['train']])
                 error = mean_absolute_error(y[indices['val']], model.predict(features[indices['val']]).clip(0, 1))
@@ -135,9 +145,11 @@ def run(args, detectors, seed, fraction):
             _, alpha, model = min(candidates, key=lambda t: t[0])
             predictions = {s: model.predict(features[indices[s]]).clip(0, 1).reshape(-1, len(detectors)) for s in evaluation}
             joblib.dump(model, output / 'regressor.pkl')
-            write_json(output / 'selection.json', {'alpha': alpha, 'validation_mae': [float(c[0]) for c in candidates]})
+            write_json(output / 'selection.json', {'alpha': alpha,
+                'candidates': [{'alpha': c[1], 'validation_mae': float(c[0])} for c in candidates]})
     else:
         if features is not None:
+            torch.manual_seed(seed)
             model = head(features.shape[1], len(detectors))
             datasets = {s: TensorDataset(torch.from_numpy(features[i]), torch.from_numpy(y[i])) for s, i in indices.items()}
             collate = None
@@ -145,10 +157,19 @@ def run(args, detectors, seed, fraction):
             encoder = Encoder(args.encoder, args.size, args.grid, args.revision)
             encoder.tune(args.mode)
             encoder_config = encoder.config()
+            torch.manual_seed(seed)
             model = Assessor(encoder, args.pool, len(detectors))
             datasets = {s: Images(rows.iloc[i]) for s, i in indices.items()}
             collate = ImageBatch(encoder, rows, labels.columns)
-        loaders = {s: DataLoader(dataset, batch_size=args.batch_size, shuffle=s == 'train', collate_fn=collate)
+        if args.head_init == 'mean':
+            last = model.head[-2] if isinstance(model, Assessor) else model[-2]
+            nn.init.zeros_(last.weight)
+            with torch.no_grad():
+                last.bias.copy_(torch.logit(torch.from_numpy(y[indices['train']].mean(0)).clamp(.01, .99)))
+        workers = args.workers if features is None else 0
+        loaders = {s: DataLoader(dataset, batch_size=args.batch_size, shuffle=s == 'train', collate_fn=collate,
+                    num_workers=workers, persistent_workers=workers > 0,
+                    pin_memory=args.device.startswith('cuda'), prefetch_factor=1 if workers else None)
                    for s, dataset in datasets.items()}
         predictions = fit_neural(model, loaders, args, output)
     parts = []
@@ -189,8 +210,13 @@ def main():
     p.add_argument('--epochs', type=int, default=30)
     p.add_argument('--patience', type=int, default=5)
     p.add_argument('--batch-size', type=int, default=8)
-    p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--encoder-lr', type=float, default=1e-5)
+    p.add_argument('--alphas', nargs='+', type=float, default=[.1, 1., 10., 100., 1e3, 1e4, 1e5, 1e6, 1e7])
+    p.add_argument('--head-init', choices=['mean', 'random'], default='mean')
+    p.add_argument('--clip-grad', type=float, default=1.)
+    p.add_argument('--amp', action='store_true', help='BF16 training; validation remains FP32')
+    p.add_argument('--workers', type=int, default=4)
     p.add_argument('--device', default='cuda')
     p.add_argument('--seeds', nargs='+', type=int, default=[43])
     p.add_argument('--fractions', nargs='+', type=float, default=[1.])

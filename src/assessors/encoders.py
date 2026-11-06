@@ -1,4 +1,5 @@
 import numpy as np
+from pathlib import Path
 import torch
 from PIL import ImageOps
 from torch import nn
@@ -36,7 +37,9 @@ class Encoder(nn.Module):
             self.model = cls.from_pretrained(HF[name], revision=revision)
             self.dim = self.model.config.hidden_size
             self.patch = self.model.config.patch_size
-            self.revision = self.model.config._commit_hash
+            from huggingface_hub import hf_hub_download
+            self.revision = self.model.config._commit_hash or Path(
+                hf_hub_download(HF[name], 'config.json', revision=revision)).parent.name
             self.mean, self.std = self.processor.image_mean, self.processor.image_std
             assert all(s % self.patch == 0 for s in self.size)
             if name == 'mae':

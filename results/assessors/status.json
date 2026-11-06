@@ -1,5 +1,5 @@
 {
-  "phase": "targets",
+  "phase": "complete",
   "detectors": [
     "yolo",
     "rf-detr"

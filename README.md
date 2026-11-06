@@ -342,9 +342,28 @@ Use `--mode full` for full fine-tuning, or `--shared --detectors yolo faster-rcn
 for a shared encoder/MLP with one output per detector. Frozen regressors can also
 be run directly with `train --features <file.npz> --regressor ridge|mlp`.
 
+The adaptation comparison preserves the original screen and uses seeds 43–45:
+
+```bash
+poetry run python -m src.assessors.run --adaptation \
+  --features data/assessors/features/224x448-grid2x4 --detectors yolo rf-detr \
+  --seeds 43 44 45 --output models/assessors/adaptation --results results/assessors/adaptation
+```
+
+It widens ridge alpha selection to 0.1–1e7, repeats the two failed spatial MLPs,
+and compares frozen/partial/full ResNet-18, DINOv2 and SigLIP 2 with matching pools
+and head architecture. New heads start at training-mean validity, use LR 3e-4
+and gradient clipping at 1; encoder LR is 1e-5. Image adaptation uses BF16 training
+and FP32 validation, batch 16, at most 30 epochs with patience 5. Only assessor
+validation selects models; test evaluation is disabled for this comparison.
+
 Models, histories and predictions go to `models/assessors/`; comparison tables,
 group-bootstrap MAE intervals and diagnostic plots go to `results/assessors/`.
 All PNG figures and CSV tables are saved directly in that folder, without HTML.
+The executed [results notebook](notebooks/assessor_results.ipynb) compares encoders,
+pooling and regressors, diagnoses failed runs, and reports paired geographic
+bootstrap intervals. Rerunning it exports `analysis_*.csv` and `analysis_*.png`
+to the same results folder; it requires the local saved assessor artifacts.
 The end-to-end runner writes `results/assessors/status.json`, reuses the frozen
 full-validation predictions, and generates source-coordinate assessor-pool
 predictions under `data/assessors/predictions/`. Threshold selection maximizes mean

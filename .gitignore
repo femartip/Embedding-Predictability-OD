@@ -23,6 +23,7 @@ logs
 
 InternImage
 
+results/assessors
 results/yolo/images
 results/yolo/iou0_images
 results/internimage/images

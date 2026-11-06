@@ -148,8 +148,10 @@ def save_results(runs, data, output, bootstrap=200):
     table.to_csv(output / 'summary.csv', index=False)
     aggregate = table.groupby(['method', 'detector', 'target', 'split', 'fraction'], as_index=False).agg(
         mae_mean=('mae', 'mean'), mae_seed_std=('mae', 'std'), runs=('seed', 'size'),
-        r2_mean=('r2', 'mean'), ece_mean=('ece', 'mean'),
-        spearman_mean=('spearman', 'mean'), aurc_mean=('aurc', 'mean'))
+        r2_mean=('r2', 'mean'), r2_seed_std=('r2', 'std'),
+        ece_mean=('ece', 'mean'), ece_seed_std=('ece', 'std'),
+        spearman_mean=('spearman', 'mean'), spearman_seed_std=('spearman', 'std'),
+        aurc_mean=('aurc', 'mean'), aurc_seed_std=('aurc', 'std'))
     aggregate.to_csv(output / 'aggregate.csv', index=False)
     (output / 'metrics.json').write_text(json.dumps({
         'target': '1 - LRP error at matching IoU 0.5',
@@ -171,6 +173,59 @@ def save_results(runs, data, output, bootstrap=200):
     print(output)
 
 
+def adaptation(args):
+    selected = [('resnet18', 'global'), ('dinov2', 'mean'), ('siglip2', 'mean')]
+    jobs = [('constant', ['--regressor', 'constant', '--seeds', args.seeds[0]])]
+    for encoder in ENCODERS:
+        if not (args.features / f'{encoder}-global.npz').exists():
+            continue
+        pools = ['global', 'spatial'] if encoder in ['resnet18', 'resnet50', 'mobilenet_v3_small'] else ['global', 'mean', 'spatial']
+        for pool in pools:
+            jobs.append((f'ridge-{encoder}-{pool}', ['--features', args.features / f'{encoder}-{pool}.npz',
+                         '--regressor', 'ridge', '--seeds', args.seeds[0]]))
+    for encoder, pool in selected:
+        jobs.append((f'frozen-{encoder}', ['--features', args.features / f'{encoder}-{pool}.npz', '--seeds', *args.seeds]))
+    for encoder in ['convnext_tiny', 'dinov2']:
+        jobs.append((f'repair-{encoder}-spatial', ['--features', args.features / f'{encoder}-spatial.npz',
+                     '--seeds', *args.seeds, '--detectors', 'rf-detr']))
+    for encoder, pool in selected:
+        metadata = json.loads((args.features / f'{encoder}-{pool}.json').read_text())
+        for mode in ['partial', 'full']:
+            jobs.append((f'{mode}-{encoder}', ['--encoder', encoder, '--pool', pool, '--mode', mode,
+                         '--seeds', *args.seeds, '--revision', metadata['revision'], '--amp']))
+    args.results.mkdir(parents=True, exist_ok=True)
+    logs = ROOT / 'logs/assessors/adaptation'
+    logs.mkdir(parents=True, exist_ok=True)
+    common = [sys.executable, '-u', '-m', 'src.assessors.train', '--data', args.data,
+              '--detectors', *args.detectors, '--epochs', args.epochs, '--batch-size', 16,
+              '--lr', .0003, '--encoder-lr', .00001, '--device', args.device, '--output', args.output]
+    commands = [[str(x) for x in [*common, *flags]] for _, flags in jobs]
+    (args.results / 'experiment.json').write_text(json.dumps({'jobs': [n for n, _ in jobs],
+        'commands': commands, 'detectors': args.detectors, 'seeds': args.seeds,
+        'evaluate_test': False, 'selection': 'Validation MAE; frozen/partial/full use matching pooling and head design',
+        'ridge_alphas': [.1, 1, 10, 100, 1e3, 1e4, 1e5, 1e6, 1e7],
+        'head_initialization': 'Training mean validity, zero final weights',
+        'training': 'BF16 for image adaptation, FP32 validation; gradient norm clipped at 1'}, indent=2))
+    for index, ((name, _), command) in enumerate(zip(jobs, commands)):
+        if index+1 < args.start_job:
+            continue
+        if name == 'partial-resnet18':
+            save_results(args.output, args.data, args.results, args.bootstrap)
+        (args.results / 'status.json').write_text(json.dumps({'phase': 'training', 'job': name,
+            'job_index': index+1, 'total_jobs': len(jobs), 'evaluate_test': False}, indent=2))
+        print(f'{index+1}/{len(jobs)}: {name}', flush=True)
+        with (logs / f'{index:02d}-{name}.log').open('a') as log:
+            result = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+        if result.returncode:
+            (args.results / 'status.json').write_text(json.dumps({'phase': 'failed', 'job': name,
+                'job_index': index+1, 'total_jobs': len(jobs), 'exit_code': result.returncode,
+                'evaluate_test': False}, indent=2))
+            result.check_returncode()
+    (args.results / 'status.json').write_text(json.dumps({'phase': 'report', 'evaluate_test': False}))
+    save_results(args.output, args.data, args.results, args.bootstrap)
+    (args.results / 'status.json').write_text(json.dumps({'phase': 'complete', 'evaluate_test': False}))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data', type=Path, default=DEFAULT_DATA)
@@ -189,11 +244,17 @@ def main():
     p.add_argument('--results', type=Path, default=ROOT / 'results/assessors')
     p.add_argument('--bootstrap', type=int, default=200)
     p.add_argument('--report-only', action='store_true', help='Analyze saved runs without training')
+    p.add_argument('--adaptation', action='store_true', help='Repair baselines and compare three shortlisted encoders across modes/seeds')
+    p.add_argument('--start-job', type=int, default=1, help='Resume the adaptation queue at this numbered job')
     p.add_argument('--prepare-targets', action='store_true')
     p.add_argument('--extract-features', action='store_true')
     p.add_argument('--selection', type=Path, default=ROOT / 'results/detector_accuracy/full_validation/selection.csv')
     p.add_argument('--groups', type=Path, default=ROOT.parent / 'Validators-OD/data/metafeatures.csv')
     args = p.parse_args()
+    if args.adaptation:
+        assert args.detectors and args.features and not args.evaluate_test
+        adaptation(args)
+        return
     if args.report_only:
         save_results(args.output, args.data, args.results, args.bootstrap)
         return
